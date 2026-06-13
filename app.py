@@ -1,6 +1,6 @@
 """
 RVC Real-Time Voice Conversion System
-RunPod Serverless Load Balancer Deployment
+RunPod Serverless Load Balancer Deployment - FIXED VERSION
 """
 
 import os
@@ -14,7 +14,7 @@ from datetime import datetime
 
 import numpy as np
 import torch
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -40,8 +40,8 @@ os.makedirs(LOG_DIR, exist_ok=True)
 model_cache: Dict[str, RVCInference] = {}
 training_jobs: Dict[str, Dict[str, Any]] = {}
 
-# Get API key from environment
-API_KEY = os.environ.get("RUNPOD_API_KEY", "default-dev-key-please-change-in-production")
+# Get API key from environment - MUST BE SET IN RUNPOD
+API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 
 # ============================================
 # Pydantic Models
@@ -59,23 +59,38 @@ class TrainResponse(BaseModel):
     model_id: Optional[str] = None
     training_time: Optional[float] = None
 
-class VoiceConversionRequest(BaseModel):
-    user_id: str
-    voice_name: str
-    audio_chunk: str  # Base64 encoded PCM16 audio
-
-class VoiceConversionResponse(BaseModel):
-    audio_chunk: str  # Base64 encoded converted PCM16 audio
-    processing_time_ms: float
-
 # ============================================
 # Security
 # ============================================
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
-def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
+def verify_api_key(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
     """Verify Bearer token for HTTP requests"""
+    # For health check, we can skip auth or require it
+    # Let's make it optional but log warnings
+    
+    if not credentials:
+        # Check if this is a health check endpoint (we'll handle in route)
+        return None
+    
+    if credentials.credentials != API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API Key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return credentials.credentials
+
+def verify_api_key_required(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Required auth for protected endpoints"""
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No token provided. Please add Authorization: Bearer <API_KEY> header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
     if credentials.credentials != API_KEY:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -87,7 +102,7 @@ def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)
 async def verify_websocket_token(websocket: WebSocket, token: Optional[str] = None):
     """Verify token from query parameter for WebSocket"""
     if not token:
-        await websocket.close(code=1008, reason="Missing authentication token")
+        await websocket.close(code=1008, reason="Missing authentication token. Use ?token=YOUR_API_KEY")
         return False
     
     if token != API_KEY:
@@ -105,10 +120,16 @@ async def lifespan(app: FastAPI):
     """Manage application lifecycle"""
     print("🚀 Starting RVC Voice Cloning Server...")
     print(f"📁 Model cache: {MODEL_CACHE_DIR}")
-    print(f"🔑 API Key configured: {'Yes' if API_KEY != 'default-dev-key-please-change-in-production' else 'Using default (insecure!)'}")
+    
+    # Check API key configuration
+    if not API_KEY:
+        print("⚠️  WARNING: RUNPOD_API_KEY environment variable not set!")
+        print("⚠️  Please set it in RunPod environment variables")
+    else:
+        print(f"🔑 API Key configured: {'Yes'}")
+    
     yield
     print("🛑 Shutting down RVC Voice Cloning Server...")
-    # Cleanup models
     for model in model_cache.values():
         model.cleanup()
 
@@ -148,7 +169,6 @@ def pcm16_to_float32(pcm16_bytes: bytes) -> np.ndarray:
 
 def float32_to_pcm16(float32_array: np.ndarray) -> bytes:
     """Convert float32 numpy array to PCM16 bytes"""
-    # Clip to [-1, 1] range
     clipped = np.clip(float32_array, -1.0, 1.0)
     pcm16 = (clipped * 32767).astype(np.int16)
     return pcm16.tobytes()
@@ -158,17 +178,55 @@ def get_model_key(user_id: str, voice_name: str) -> str:
     return f"{user_id}_{voice_name}".replace(" ", "_").lower()
 
 # ============================================
-# Training Endpoint
+# Public Endpoints (No Auth Required)
+# ============================================
+
+@app.get("/")
+async def root():
+    """Root endpoint - useful for testing"""
+    return {
+        "service": "RVC Voice Cloning API",
+        "status": "running",
+        "version": "1.0.0",
+        "auth_required": bool(API_KEY),
+        "endpoints": {
+            "health": "GET /health",
+            "train": "POST /train (requires Bearer token)",
+            "websocket": "WS /ws?token=YOUR_API_KEY",
+            "models": "GET /models (requires Bearer token)"
+        }
+    }
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint - NO AUTH REQUIRED for RunPod
+    This allows RunPod's load balancer to check status
+    """
+    return {
+        "status": "healthy",
+        "models_loaded": len(model_cache),
+        "timestamp": datetime.now().isoformat(),
+        "api_key_configured": bool(API_KEY)
+    }
+
+@app.get("/ping")
+async def ping():
+    """Simple ping endpoint for connectivity testing"""
+    return {"pong": True, "timestamp": datetime.now().isoformat()}
+
+# ============================================
+# Protected Endpoints (Auth Required)
 # ============================================
 
 @app.post("/train", response_model=TrainResponse)
 async def train_voice_model(
     request: TrainRequest,
-    api_key: str = Depends(verify_api_key)
+    api_key: str = Depends(verify_api_key_required)
 ):
     """
     Train a new RVC voice model from uploaded audio sample.
-    Accepts flat JSON payload: user_id, voice_name, audio
+    Requires Bearer token authentication.
     """
     start_time = time.time()
     
@@ -199,8 +257,7 @@ async def train_voice_model(
             temp_dir=TRAINING_CACHE_DIR
         )
         
-        # Train the model (this would be async in production)
-        # For demo, we'll simulate training or implement actual RVC training
+        # Train the model
         training_success = await trainer.train_from_audio(
             audio_path=temp_audio_path,
             voice_name=request.voice_name
@@ -232,22 +289,9 @@ async def train_voice_model(
         print(f"Training error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============================================
-# Health Check
-# ============================================
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "models_loaded": len(model_cache),
-        "timestamp": datetime.now().isoformat()
-    }
-
 @app.get("/models")
-async def list_models(api_key: str = Depends(verify_api_key)):
-    """List all loaded models"""
+async def list_models(api_key: str = Depends(verify_api_key_required)):
+    """List all loaded models - requires authentication"""
     return {
         "models": list(model_cache.keys()),
         "count": len(model_cache)
@@ -302,15 +346,14 @@ async def websocket_voice_conversion(websocket: WebSocket):
                         current_model_key = model_key
                         print(f"📦 Using cached model: {model_key}")
                     else:
-                        # Model not found - send error
                         await websocket.send_json({
-                            "error": f"Model for voice '{voice_name}' not found. Please train it first using /train endpoint."
+                            "error": f"Model for voice '{voice_name}' not found. Please train it first."
                         })
                         continue
                 
                 if current_model is None:
                     await websocket.send_json({
-                        "error": "No model loaded. Please train a voice model first."
+                        "error": "No model loaded."
                     })
                     continue
                 
@@ -346,9 +389,6 @@ async def websocket_voice_conversion(websocket: WebSocket):
         print(f"🔌 WebSocket disconnected: {websocket.client}")
     except Exception as e:
         print(f"WebSocket error: {e}")
-    finally:
-        # Cleanup
-        pass
 
 # ============================================
 # Main Entry Point
