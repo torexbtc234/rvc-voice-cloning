@@ -8,7 +8,6 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV DEBIAN_FRONTEND=noninteractive
-ENV RUNPOD_API_KEY=changeme-default-key-please-set-in-production
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -22,7 +21,7 @@ RUN apt-get update && apt-get install -y \
     libavformat-dev \
     libavutil-dev \
     libswresample-dev \
-    portaudio19-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
@@ -40,8 +39,8 @@ RUN mkdir -p /app/models /app/training /app/logs
 # Expose the port
 EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+# Health check for RunPod
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # Run the application
