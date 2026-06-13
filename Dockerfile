@@ -1,47 +1,407 @@
-# Use official PyTorch CUDA image for GPU acceleration
-FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+"""
+RVC Real-Time Voice Conversion System
+RunPod Serverless Load Balancer Deployment - COMPLETE FIXED VERSION
+All endpoints require authentication matching RunPod's security model
+"""
 
-# Set working directory
-WORKDIR /app
+import os
+import asyncio
+import base64
+import json
+import time
+from typing import Optional, Dict, Any
+from datetime import datetime
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV DEBIAN_FRONTEND=noninteractive
+import numpy as np
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, Field
+from contextlib import asynccontextmanager
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    make \
-    cmake \
-    libsndfile1 \
-    ffmpeg \
-    libavcodec-extra \
-    libavformat-dev \
-    libavutil-dev \
-    libswresample-dev \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+# Import RVC modules
+from rvc_inference import RVCInference
+from rvc_trainer import RVCTrainer
 
-# Copy requirements first for better caching
-COPY requirements.txt .
+# ============================================
+# Configuration
+# ============================================
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+MODEL_CACHE_DIR = "/app/models"
+TRAINING_CACHE_DIR = "/app/training"
+LOG_DIR = "/app/logs"
 
-# Copy all application files
-COPY . .
+os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+os.makedirs(TRAINING_CACHE_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
 
-# Create necessary directories
-RUN mkdir -p /app/models /app/training /app/logs
+# Global model cache
+model_cache: Dict[str, RVCInference] = {}
 
-# Expose the port
-EXPOSE 8000
+# Get API keys from environment
+# RUNPOD_API_KEY: The key users must provide (set in RunPod env)
+# INTERNAL_API_KEY: For RunPod's own health checks (optional)
+RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
+HEALTH_API_KEY = os.environ.get("HEALTH_API_KEY", RUNPOD_API_KEY)  # Can be same or different
 
-# Health check for RunPod
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+# ============================================
+# Pydantic Models
+# ============================================
 
-# Run the application
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+class TrainRequest(BaseModel):
+    """Training request - flat structure as required"""
+    user_id: str = Field(..., description="Unique user identifier")
+    voice_name: str = Field(..., description="Name for the voice model")
+    audio: str = Field(..., description="Base64 encoded audio file")
+
+class TrainResponse(BaseModel):
+    success: bool
+    message: str
+    model_id: Optional[str] = None
+    training_time: Optional[float] = None
+
+# ============================================
+# Security - All endpoints require auth
+# ============================================
+
+security = HTTPBearer(auto_error=False)
+
+def verify_api_key_required(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """
+    Required auth for ALL protected endpoints including health.
+    This matches RunPod's load balancer expectations.
+    """
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No token provided. Please add Authorization: Bearer <API_KEY> header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    if credentials.credentials != RUNPOD_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API Key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return credentials.credentials
+
+async def verify_websocket_token(websocket: WebSocket, token: Optional[str] = None):
+    """Verify token from query parameter for WebSocket"""
+    if not token:
+        await websocket.close(code=1008, reason="Missing authentication token. Use ?token=YOUR_API_KEY")
+        return False
+    
+    if token != RUNPOD_API_KEY:
+        await websocket.close(code=1008, reason="Invalid authentication token")
+        return False
+    
+    return True
+
+# ============================================
+# FastAPI App with Lifespan Management
+# ============================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle"""
+    print("=" * 50)
+    print("🚀 Starting RVC Voice Cloning Server...")
+    print(f"📁 Model cache: {MODEL_CACHE_DIR}")
+    print(f"📁 Training cache: {TRAINING_CACHE_DIR}")
+    
+    # Check API key configuration
+    if not RUNPOD_API_KEY:
+        print("❌ FATAL: RUNPOD_API_KEY environment variable not set!")
+        print("⚠️  Please set it in RunPod environment variables")
+        print("⚠️  The endpoint will reject all requests until set")
+    else:
+        print(f"🔑 API Key configured: {RUNPOD_API_KEY[:8]}...")
+    
+    print("=" * 50)
+    
+    yield
+    
+    print("🛑 Shutting down RVC Voice Cloning Server...")
+    for model in model_cache.values():
+        model.cleanup()
+
+app = FastAPI(
+    title="RVC Voice Cloning API",
+    description="Real-time voice conversion with RVC for RunPod Serverless",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS Middleware - Allow all origins for RunPod compatibility
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
+# ============================================
+# Helper Functions
+# ============================================
+
+def decode_base64_audio(base64_str: str) -> bytes:
+    """Decode base64 string to bytes"""
+    return base64.b64decode(base64_str)
+
+def encode_base64_audio(audio_bytes: bytes) -> str:
+    """Encode bytes to base64 string"""
+    return base64.b64encode(audio_bytes).decode('utf-8')
+
+def pcm16_to_float32(pcm16_bytes: bytes) -> np.ndarray:
+    """Convert PCM16 bytes to float32 numpy array"""
+    pcm16 = np.frombuffer(pcm16_bytes, dtype=np.int16)
+    return pcm16.astype(np.float32) / 32768.0
+
+def float32_to_pcm16(float32_array: np.ndarray) -> bytes:
+    """Convert float32 numpy array to PCM16 bytes"""
+    clipped = np.clip(float32_array, -1.0, 1.0)
+    pcm16 = (clipped * 32767).astype(np.int16)
+    return pcm16.tobytes()
+
+def get_model_key(user_id: str, voice_name: str) -> str:
+    """Generate unique model key"""
+    return f"{user_id}_{voice_name}".replace(" ", "_").lower()
+
+# ============================================
+# ALL Endpoints Require Authentication
+# ============================================
+
+@app.get("/")
+async def root(api_key: str = Depends(verify_api_key_required)):
+    """Root endpoint - requires authentication"""
+    return {
+        "service": "RVC Voice Cloning API",
+        "status": "running",
+        "version": "1.0.0",
+        "endpoints": {
+            "health": "GET /health",
+            "train": "POST /train",
+            "websocket": "WS /ws?token=YOUR_API_KEY",
+            "models": "GET /models"
+        },
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/health")
+async def health_check(api_key: str = Depends(verify_api_key_required)):
+    """
+    Health check endpoint - REQUIRES AUTHENTICATION
+    This matches RunPod's load balancer expectations
+    """
+    return {
+        "status": "healthy",
+        "models_loaded": len(model_cache),
+        "timestamp": datetime.now().isoformat(),
+        "api_key_configured": bool(RUNPOD_API_KEY)
+    }
+
+@app.get("/ping")
+async def ping(api_key: str = Depends(verify_api_key_required)):
+    """
+    Simple ping endpoint for connectivity testing - REQUIRES AUTHENTICATION
+    """
+    return {
+        "pong": True,
+        "timestamp": datetime.now().isoformat(),
+        "models_loaded": len(model_cache)
+    }
+
+# ============================================
+# Protected Endpoints
+# ============================================
+
+@app.post("/train", response_model=TrainResponse)
+async def train_voice_model(
+    request: TrainRequest,
+    api_key: str = Depends(verify_api_key_required)
+):
+    """
+    Train a new RVC voice model from uploaded audio sample.
+    Requires Bearer token authentication.
+    Accepts flat JSON payload: user_id, voice_name, audio
+    """
+    start_time = time.time()
+    
+    try:
+        model_key = get_model_key(request.user_id, request.voice_name)
+        
+        # Check if model already exists
+        if model_key in model_cache:
+            return TrainResponse(
+                success=True,
+                message=f"Model '{request.voice_name}' already loaded",
+                model_id=model_key,
+                training_time=0
+            )
+        
+        # Decode audio
+        audio_bytes = decode_base64_audio(request.audio)
+        
+        # Save audio file temporarily
+        temp_audio_path = os.path.join(TRAINING_CACHE_DIR, f"{model_key}_input.wav")
+        with open(temp_audio_path, "wb") as f:
+            f.write(audio_bytes)
+        
+        # Initialize trainer
+        trainer = RVCTrainer(
+            model_key=model_key,
+            cache_dir=MODEL_CACHE_DIR,
+            temp_dir=TRAINING_CACHE_DIR
+        )
+        
+        # Train the model
+        training_success = await trainer.train_from_audio(
+            audio_path=temp_audio_path,
+            voice_name=request.voice_name
+        )
+        
+        if not training_success:
+            raise Exception("Training failed")
+        
+        # Load the trained model
+        inference = RVCInference(
+            model_key=model_key,
+            model_path=os.path.join(MODEL_CACHE_DIR, f"{model_key}.pth"),
+            config_path=os.path.join(MODEL_CACHE_DIR, f"{model_key}.json")
+        )
+        
+        inference.load()
+        model_cache[model_key] = inference
+        
+        training_time = time.time() - start_time
+        
+        return TrainResponse(
+            success=True,
+            message=f"Voice '{request.voice_name}' trained successfully in {training_time:.1f}s",
+            model_id=model_key,
+            training_time=training_time
+        )
+        
+    except Exception as e:
+        print(f"Training error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/models")
+async def list_models(api_key: str = Depends(verify_api_key_required)):
+    """List all loaded models - requires authentication"""
+    return {
+        "models": list(model_cache.keys()),
+        "count": len(model_cache),
+        "timestamp": datetime.now().isoformat()
+    }
+
+# ============================================
+# WebSocket Endpoint for Real-time Conversion
+# ============================================
+
+@app.websocket("/ws")
+async def websocket_voice_conversion(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time voice conversion.
+    Token MUST be passed as query parameter: ?token=<API_KEY>
+    """
+    # Extract token from query parameters
+    token = websocket.query_params.get("token")
+    
+    # Verify token
+    if not await verify_websocket_token(websocket, token):
+        return
+    
+    await websocket.accept()
+    print(f"✅ WebSocket connected: {websocket.client}")
+    
+    current_model_key = None
+    current_model = None
+    
+    try:
+        while True:
+            # Receive message
+            data = await websocket.receive_text()
+            
+            try:
+                message = json.loads(data)
+                user_id = message.get("user_id")
+                voice_name = message.get("voice_name")
+                audio_chunk_b64 = message.get("audio_chunk")
+                
+                if not all([user_id, voice_name, audio_chunk_b64]):
+                    await websocket.send_json({
+                        "error": "Missing required fields: user_id, voice_name, audio_chunk"
+                    })
+                    continue
+                
+                # Get or load model
+                model_key = get_model_key(user_id, voice_name)
+                
+                if model_key != current_model_key:
+                    if model_key in model_cache:
+                        current_model = model_cache[model_key]
+                        current_model_key = model_key
+                        print(f"📦 Using cached model: {model_key}")
+                    else:
+                        await websocket.send_json({
+                            "error": f"Model for voice '{voice_name}' not found. Please train it first using /train endpoint."
+                        })
+                        continue
+                
+                if current_model is None:
+                    await websocket.send_json({
+                        "error": "No model loaded. Please train a voice model first."
+                    })
+                    continue
+                
+                # Process audio chunk
+                start_process = time.time()
+                
+                # Decode audio
+                audio_bytes = decode_base64_audio(audio_chunk_b64)
+                audio_float32 = pcm16_to_float32(audio_bytes)
+                
+                # Perform voice conversion
+                converted_audio = await current_model.convert(audio_float32)
+                
+                # Convert back to PCM16
+                converted_bytes = float32_to_pcm16(converted_audio)
+                converted_b64 = encode_base64_audio(converted_bytes)
+                
+                processing_time = (time.time() - start_process) * 1000
+                
+                # Send response
+                await websocket.send_json({
+                    "audio_chunk": converted_b64,
+                    "processing_time_ms": round(processing_time, 2)
+                })
+                
+            except json.JSONDecodeError:
+                await websocket.send_json({"error": "Invalid JSON format"})
+            except Exception as e:
+                print(f"Processing error: {e}")
+                await websocket.send_json({"error": f"Processing error: {str(e)}"})
+                
+    except WebSocketDisconnect:
+        print(f"🔌 WebSocket disconnected: {websocket.client}")
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+
+# ============================================
+# Main Entry Point
+# ============================================
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,
+        workers=1
+    )
